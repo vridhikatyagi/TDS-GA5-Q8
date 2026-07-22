@@ -11,8 +11,6 @@ import os
 import re
 import socket
 from pathlib import Path
-from urllib.parse import urlsplit
-
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -171,25 +169,43 @@ def _resolve_host_ips(hostname: str):
 def _validate_url(url_str: str):
     """
     Returns (allowed: bool, reason: str, parsed_url_or_None)
+
+    Parses with httpx.URL — the SAME parser that actually performs the
+    request — so validation and execution can never disagree about what
+    host is being contacted. Using a different parser (e.g. stdlib
+    urlsplit) for validation than for the actual fetch is a classic SSRF
+    bypass class: attacker crafts a URL the two parsers disagree on.
     """
     if not isinstance(url_str, str) or not url_str:
         return False, "invalid url argument", None
 
+    # Reject control characters / whitespace outright — different parsers
+    # (and different HTTP client layers) can strip or interpret these
+    # inconsistently, which is itself a source of parser-confusion bugs.
+    if re.search(r"[\x00-\x1f\x7f]", url_str):
+        return False, "control characters in url", None
+    if re.search(r"\s", url_str):
+        return False, "whitespace in url", None
+
     try:
-        parts = urlsplit(url_str)
+        parsed = httpx.URL(url_str)
     except Exception:
         return False, "unparseable url", None
 
-    scheme = parts.scheme.lower()
+    scheme = (parsed.scheme or "").lower()
     if scheme not in ALLOWED_SCHEMES:
         return False, f"scheme not allowed: {scheme}", None
 
     # Reject userinfo (user:pass@host) — classic userinfo-confusion trick,
     # e.g. https://example.com@evil.com/
-    if parts.username or parts.password or "@" in parts.netloc:
+    if parsed.username or parsed.password:
+        return False, "userinfo not allowed in url", None
+    # Belt-and-suspenders: also reject a literal '@' anywhere in the
+    # authority component as parsed by httpx.
+    if "@" in (parsed.netloc.decode() if isinstance(parsed.netloc, bytes) else parsed.netloc):
         return False, "userinfo not allowed in url", None
 
-    hostname = parts.hostname
+    hostname = parsed.host
     if not hostname:
         return False, "missing hostname", None
     hostname = hostname.lower().rstrip(".")
@@ -218,7 +234,7 @@ def _validate_url(url_str: str):
         if _is_private_ip(ip):
             return False, f"host resolves to private/blocked ip: {ip}", None
 
-    return True, "host allowed", parts
+    return True, "host allowed", parsed
 
 
 def run_fetch_url(url_str: str):
@@ -234,7 +250,10 @@ def run_fetch_url(url_str: str):
 
         try:
             with httpx.Client(follow_redirects=False, timeout=10.0) as client:
-                resp = client.get(current)
+                # Use the exact parsed+validated URL object, not a
+                # re-parsed string, so the request can never target
+                # something other than what was validated.
+                resp = client.get(parsed)
         except Exception as e:
             return None, f"fetch error: {e}"
 
@@ -242,9 +261,10 @@ def run_fetch_url(url_str: str):
             location = resp.headers.get("location")
             if not location:
                 return None, "redirect with no location"
-            # Resolve relative redirects against current url.
-            from urllib.parse import urljoin
-            current = urljoin(current, location)
+            # Resolve relative redirects against current url using
+            # httpx.URL.join, which is the same parser used everywhere
+            # else, avoiding stdlib-vs-httpx disagreement on the result.
+            current = str(parsed.join(location))
             continue
 
         return resp.text, None
